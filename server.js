@@ -10,8 +10,8 @@ const DEFAULT_MATCH_URL =
   process.env.CRICKET_MATCH_URL ||
   'https://crex.com/scoreboard/1057/2EJ/15th-Match/64/TI/fata-vs-hydr-15th-match-national-t20-qualifiers-2026/live';
 const CRICBUZZ_LIVE_LIST_URL = 'https://www.cricbuzz.com/cricket-match/live-scores';
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 700);
-const RUNNING_CACHE_TTL_MS = Number(process.env.RUNNING_CACHE_TTL_MS || 15000);
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 1200);
+const RUNNING_CACHE_TTL_MS = Number(process.env.RUNNING_CACHE_TTL_MS || 2500);
 const RUNNING_MATCH_LIMIT = Number(process.env.RUNNING_MATCH_LIMIT || 16);
 const UPCOMING_DETAILS_LIMIT = Number(process.env.UPCOMING_DETAILS_LIMIT || 12);
 
