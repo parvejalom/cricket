@@ -10,10 +10,11 @@ const DEFAULT_MATCH_URL =
   process.env.CRICKET_MATCH_URL ||
   'https://crex.com/scoreboard/1057/2EJ/15th-Match/64/TI/fata-vs-hydr-15th-match-national-t20-qualifiers-2026/live';
 const CRICBUZZ_LIVE_LIST_URL = 'https://www.cricbuzz.com/cricket-match/live-scores';
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 1200);
-const RUNNING_CACHE_TTL_MS = Number(process.env.RUNNING_CACHE_TTL_MS || 2500);
-const RUNNING_MATCH_LIMIT = Number(process.env.RUNNING_MATCH_LIMIT || 16);
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 15000);
+const RUNNING_CACHE_TTL_MS = Number(process.env.RUNNING_CACHE_TTL_MS || 30000);
+const RUNNING_MATCH_LIMIT = Number(process.env.RUNNING_MATCH_LIMIT || 10);
 const UPCOMING_DETAILS_LIMIT = Number(process.env.UPCOMING_DETAILS_LIMIT || 12);
+const UPSTREAM_CALL_TIMEOUT_MS = Number(process.env.UPSTREAM_CALL_TIMEOUT_MS || 6500);
 
 let cache = {
   ts: 0,
@@ -49,6 +50,18 @@ app.use(express.static(path.join(__dirname, 'public')));
 function cleanText(input) {
   if (typeof input !== 'string') return '';
   return input.replace(/\s+/g, ' ').trim();
+}
+
+async function withTimeout(task, timeoutMs, fallbackValue = null) {
+  let timer;
+  try {
+    const timeoutPromise = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(fallbackValue), timeoutMs);
+    });
+    return await Promise.race([task(), timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function parseScoreBits(scoreText) {
@@ -990,7 +1003,12 @@ async function fetchLiveAndUpcomingMatchesFromCricbuzz(limit = RUNNING_MATCH_LIM
 
   const runningSettled = await Promise.allSettled(
     runningCandidates.map(async (candidate) => {
-      const base = await fetchAndParseScore(candidate.url);
+      const base = await withTimeout(
+        () => fetchAndParseScore(candidate.url),
+        UPSTREAM_CALL_TIMEOUT_MS,
+        null,
+      );
+      if (!base) return null;
       const live = augmentLiveFields(base, candidate.url);
       const status = cleanText(live.status || candidate.status || 'LIVE');
       if (isNonRunningStatus(status)) return null;
@@ -1026,7 +1044,11 @@ async function fetchLiveAndUpcomingMatchesFromCricbuzz(limit = RUNNING_MATCH_LIM
 
   const upcomingSettled = await Promise.allSettled(
     upcomingCandidates.slice(0, Math.max(1, UPCOMING_DETAILS_LIMIT)).map(async (candidate) => {
-      const details = await fetchUpcomingMatchDetails(candidate.url);
+      const details = await withTimeout(
+        () => fetchUpcomingMatchDetails(candidate.url),
+        UPSTREAM_CALL_TIMEOUT_MS,
+        { headline: '', description: '', schedule: 'TBA', start_time_utc: '', venue: '' },
+      );
       return {
         match: cleanText(details.headline || candidate.title || candidate.name || 'Upcoming Match'),
         status: cleanText(candidate.status || 'Upcoming Match'),
@@ -1047,7 +1069,11 @@ async function fetchLiveAndUpcomingMatchesFromCricbuzz(limit = RUNNING_MATCH_LIM
 
   const disruptedSettled = await Promise.allSettled(
     disruptedCandidates.slice(0, Math.max(1, UPCOMING_DETAILS_LIMIT)).map(async (candidate) => {
-      const details = await fetchUpcomingMatchDetails(candidate.url);
+      const details = await withTimeout(
+        () => fetchUpcomingMatchDetails(candidate.url),
+        UPSTREAM_CALL_TIMEOUT_MS,
+        { headline: '', description: '', schedule: 'TBA', start_time_utc: '', venue: '' },
+      );
       return {
         match: cleanText(details.headline || candidate.title || candidate.name || 'Match Alert'),
         status: cleanText(candidate.status || 'Match Alert'),
@@ -1094,7 +1120,7 @@ app.get('/api/live-score', async (req, res) => {
       cached: false,
     };
 
-    cache = { ts: now, sourceUrl, payload };
+    cache = { ts: Date.now(), sourceUrl, payload };
     return res.json(payload);
   } catch (error) {
     if (sourceUrl !== fallbackUrl) {
@@ -1108,7 +1134,7 @@ app.get('/api/live-score', async (req, res) => {
           failover_from: sourceUrl,
           cached: false,
         };
-        cache = { ts: now, sourceUrl: fallbackUrl, payload };
+        cache = { ts: Date.now(), sourceUrl: fallbackUrl, payload };
         return res.json(payload);
       } catch {
         // continue to stale/error response
@@ -1162,7 +1188,7 @@ app.get('/api/running-matches', async (req, res) => {
       disrupted_matches,
       cached: false,
     };
-    runningMatchesCache = { ts: now, payload };
+    runningMatchesCache = { ts: Date.now(), payload };
     return res.json(payload);
   } catch (error) {
     if (runningMatchesCache.payload) {
