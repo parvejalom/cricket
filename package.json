@@ -1,0 +1,16 @@
+﻿{
+  "name": "obs-cricket-live-score-overlay",
+  "version": "1.0.0",
+  "description": "OBS Browser Source cricket live score overlay with Cricbuzz backend proxy",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "axios": "^1.8.4",
+    "cheerio": "^1.0.0",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0"
+  }
+}
