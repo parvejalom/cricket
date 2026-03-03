@@ -589,6 +589,47 @@ function parseFromHtmlFallback($) {
   };
 }
 
+function splitPlayers(raw) {
+  return String(raw || '')
+    .split(',')
+    .map((p) => cleanText(p))
+    .filter(Boolean)
+    .slice(0, 30);
+}
+
+function parseTeamListsFromText(rawHtml, label) {
+  const text = cleanText(
+    String(rawHtml || '')
+      .replace(/\\u0027/g, "'")
+      .replace(/\\n/g, ' ')
+      .replace(/\\t/g, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+  );
+
+  const map = {};
+  const pattern = new RegExp(
+    `([A-Z][A-Za-z .&'-]{1,50})\\s*\\(${label}\\)\\s*:\\s*(.+?)(?=\\s+[A-Z][A-Za-z .&'-]{1,50}\\s*\\((?:Playing XI|Squad)\\)\\s*:|\\s+Squads?:|$)`,
+    'gi',
+  );
+
+  for (const match of text.matchAll(pattern)) {
+    const team = cleanText(match[1]);
+    const players = splitPlayers(match[2]);
+    if (team && players.length) map[team] = players;
+  }
+
+  return map;
+}
+
+function mergeTeamMaps(primary = {}, fallback = {}) {
+  const merged = { ...(fallback || {}), ...(primary || {}) };
+  return Object.fromEntries(
+    Object.entries(merged).map(([team, players]) => [team, Array.isArray(players) ? players : []]),
+  );
+}
+
 function parseMatchMetaFromCricbuzzHtml($, html) {
   const rawHtml = String(html || '');
   const meta = {
@@ -596,6 +637,8 @@ function parseMatchMetaFromCricbuzzHtml($, html) {
     toss: '',
     umpires: [],
     match_referee: '',
+    playing_xi_by_team: {},
+    squads_by_team: {},
   };
 
   $('script[type="application/ld+json"]').each((_, node) => {
@@ -641,6 +684,16 @@ function parseMatchMetaFromCricbuzzHtml($, html) {
   if (refereeMatch && cleanText(refereeMatch[1])) {
     meta.match_referee = cleanText(refereeMatch[1]);
   }
+
+  const tossLong =
+    rawHtml.match(/([A-Za-z .&'-]+)\s+have won the toss and have opted to\s+([A-Za-z ]+)/i) ||
+    rawHtml.match(/([A-Za-z .&'-]+)\s+won the toss and elected to\s+([A-Za-z ]+)/i);
+  if (!meta.toss && tossLong) {
+    meta.toss = `${cleanText(tossLong[1])} (${cleanText(tossLong[2])})`;
+  }
+
+  meta.playing_xi_by_team = parseTeamListsFromText(rawHtml, 'Playing XI');
+  meta.squads_by_team = parseTeamListsFromText(rawHtml, 'Squad');
 
   return meta;
 }
@@ -688,6 +741,8 @@ async function fetchAndParseScore(sourceUrl) {
         ? primaryParsed.umpires
         : meta.umpires,
       match_referee: cleanText(primaryParsed.match_referee || meta.match_referee || 'N/A'),
+      playing_xi_by_team: mergeTeamMaps(primaryParsed.playing_xi_by_team, meta.playing_xi_by_team),
+      squads_by_team: mergeTeamMaps(primaryParsed.squads_by_team, meta.squads_by_team),
     };
   }
 
@@ -708,6 +763,14 @@ async function fetchAndParseScore(sourceUrl) {
             ? scorecardParsed.umpires
             : (scorecardMeta.umpires.length ? scorecardMeta.umpires : meta.umpires),
           match_referee: cleanText(scorecardParsed.match_referee || scorecardMeta.match_referee || meta.match_referee || 'N/A'),
+          playing_xi_by_team: mergeTeamMaps(
+            scorecardParsed.playing_xi_by_team,
+            mergeTeamMaps(scorecardMeta.playing_xi_by_team, meta.playing_xi_by_team),
+          ),
+          squads_by_team: mergeTeamMaps(
+            scorecardParsed.squads_by_team,
+            mergeTeamMaps(scorecardMeta.squads_by_team, meta.squads_by_team),
+          ),
         };
       }
     } catch {
@@ -722,6 +785,8 @@ async function fetchAndParseScore(sourceUrl) {
     toss: cleanText(fallback.toss || meta.toss || 'N/A'),
     umpires: Array.isArray(fallback.umpires) && fallback.umpires.length ? fallback.umpires : meta.umpires,
     match_referee: cleanText(fallback.match_referee || meta.match_referee || 'N/A'),
+    playing_xi_by_team: mergeTeamMaps(fallback.playing_xi_by_team, meta.playing_xi_by_team),
+    squads_by_team: mergeTeamMaps(fallback.squads_by_team, meta.squads_by_team),
   };
 }
 
