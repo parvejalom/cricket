@@ -6,25 +6,24 @@ const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DEFAULT_MATCH_URL =
-  process.env.CRICKET_MATCH_URL ||
-  'https://crex.com/scoreboard/1057/2EJ/15th-Match/64/TI/fata-vs-hydr-15th-match-national-t20-qualifiers-2026/live';
+const DEFAULT_MATCH_URL = String(process.env.CRICKET_MATCH_URL || '').trim();
 const CRICBUZZ_LIVE_LIST_URL = 'https://www.cricbuzz.com/cricket-match/live-scores';
 const CREX_LIVE_MATCHES_URL = String(process.env.CREX_LIVE_MATCHES_URL || 'https://crex.com/live-matches').trim();
 const LEGACY_BOARD_URL = String(process.env.CRICKET_LEGACY_BOARD_URL || 'https://cricket-l117.onrender.com/api/running-matches').trim();
 const EXTRA_SOURCE_URLS = [
-  DEFAULT_MATCH_URL,
+  ...(DEFAULT_MATCH_URL ? [DEFAULT_MATCH_URL] : []),
   ...String(process.env.CRICKET_EXTRA_SOURCE_URLS || '')
     .split(/[\r\n,]+/)
     .map((item) => item.trim())
     .filter(Boolean),
 ];
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 15000);
-const RUNNING_CACHE_TTL_MS = Number(process.env.RUNNING_CACHE_TTL_MS || 30000);
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 2000);
+const RUNNING_CACHE_TTL_MS = Number(process.env.RUNNING_CACHE_TTL_MS || 2000);
 const RUNNING_MATCH_LIMIT = Number(process.env.RUNNING_MATCH_LIMIT || 50);
 const UPCOMING_DETAILS_LIMIT = Number(process.env.UPCOMING_DETAILS_LIMIT || 12);
 const UPSTREAM_CALL_TIMEOUT_MS = Number(process.env.UPSTREAM_CALL_TIMEOUT_MS || 6500);
 const MATCH_PARSE_TIMEOUT_MS = Math.max(UPSTREAM_CALL_TIMEOUT_MS, 12000);
+const SOURCE_PAYLOAD_CACHE_TTL_MS = Number(process.env.SOURCE_PAYLOAD_CACHE_TTL_MS || Math.max(CACHE_TTL_MS, 4000));
 
 let cache = {
   ts: 0,
@@ -35,6 +34,7 @@ let runningMatchesCache = {
   ts: 0,
   payload: null,
 };
+const sourcePayloadCache = new Map();
 const trendStore = new Map();
 
 const limiter = rateLimit({
@@ -75,6 +75,19 @@ function cleanRichText(input) {
   );
 }
 
+function normalizeOversText(input) {
+  const raw = cleanText(String(input || ''));
+  if (!raw || /^N\/A$/i.test(raw) || raw === '--') return 'N/A';
+
+  const cleaned = cleanText(
+    raw
+      .replace(/\bov(?:ers?)?\.?\b/gi, ' ')
+      .replace(/[()]/g, ' ')
+  );
+  const match = cleaned.match(/(\d+(?:\.\d+)?)/);
+  return match ? match[1] : raw;
+}
+
 async function withTimeout(task, timeoutMs, fallbackValue = null) {
   let timer;
   try {
@@ -105,7 +118,7 @@ function toDisplay(value, fallback = 'N/A') {
 }
 
 function parseOversToBalls(oversValue) {
-  const overs = Number(oversValue);
+  const overs = Number(normalizeOversText(oversValue));
   if (!Number.isFinite(overs) || overs < 0) return 'N/A';
   const whole = Math.floor(overs);
   const partial = Math.round((overs - whole) * 10);
@@ -121,7 +134,7 @@ function parseRunsFromScore(scoreText) {
 }
 
 function parseOverParts(oversValue) {
-  const ov = Number(oversValue);
+  const ov = Number(normalizeOversText(oversValue));
   if (!Number.isFinite(ov) || ov < 0) {
     return { completedOvers: 0, ballsInCurrentOver: 0, totalBalls: 0 };
   }
@@ -135,7 +148,7 @@ function parseOverParts(oversValue) {
 }
 
 function inferPhase(oversValue) {
-  const ov = Number(String(oversValue || '').replace(/[()]/g, ''));
+  const ov = Number(normalizeOversText(oversValue));
   if (!Number.isFinite(ov) || ov < 0) return 'LIVE';
   if (ov < 6) return 'POWERPLAY';
   if (ov < 15) return 'MIDDLE OVERS';
@@ -348,7 +361,7 @@ function parseFromCrex($, html) {
     match: `${team1Name} vs ${team2Name}`,
     batting_team: battingTeam,
     score: cleanText(live.score1 || 'N/A'),
-    overs: cleanText(live.over1 || 'N/A'),
+    overs: normalizeOversText(live.over1 || 'N/A'),
     crr: cleanText(live.crr || 'N/A'),
     rrr: cleanText(live.rrr || 'N/A'),
     target: cleanText(live.rT || 'N/A') === '0' ? 'N/A' : cleanText(live.rT || 'N/A'),
@@ -401,7 +414,7 @@ function parseFromCrex($, html) {
     live_stats: {
       last_over_summary: latestOverInfo.join(' ') || 'N/A',
       ball_by_ball: ballByBall,
-      powerplay_score: powerplayScore || (safeNum(live.over1) <= 6 ? cleanText(live.score1 || 'N/A') : 'N/A'),
+      powerplay_score: powerplayScore || (safeNum(normalizeOversText(live.over1)) <= 6 ? cleanText(live.score1 || 'N/A') : 'N/A'),
       run_comparison: {
         current_rr: Number.isFinite(Number(live.crr)) ? Number(live.crr) : null,
         required_rr: Number.isFinite(Number(live.rrr)) ? Number(live.rrr) : null,
@@ -414,9 +427,9 @@ function parseFromCrex($, html) {
     },
     match_flow: {
       over_progress: {
-        balls_in_over: parseOverParts(cleanText(live.over1 || '0')).ballsInCurrentOver,
+        balls_in_over: parseOverParts(normalizeOversText(live.over1 || '0')).ballsInCurrentOver,
         balls_per_over: 6,
-        progress_pct: Math.round((parseOverParts(cleanText(live.over1 || '0')).ballsInCurrentOver / 6) * 100),
+        progress_pct: Math.round((parseOverParts(normalizeOversText(live.over1 || '0')).ballsInCurrentOver / 6) * 100),
       },
       indicators: {
         free_hit: hasNoBall,
@@ -484,7 +497,7 @@ function parseFromEmbeddedMiniscore($, html) {
 
   const runs = Number(miniscore.batTeam?.teamScore ?? innings.score ?? 0);
   const wkts = Number(miniscore.batTeam?.teamWkts ?? innings.wickets ?? 0);
-  const overs = toDisplay(miniscore.overs ?? innings.overs, 'N/A');
+  const overs = normalizeOversText(toDisplay(miniscore.overs ?? innings.overs, 'N/A'));
   const targetValue = miniscore.target;
   const remRuns = miniscore.remRunsToWin;
   const oversRem = miniscore.oversRem;
@@ -565,7 +578,7 @@ function parseFromMetaFallback($) {
     match: matchTitle,
     batting_team: cleanText(matchTitle.split('vs')[0] || 'N/A'),
     score: scoreMatch ? `${scoreMatch[2]}-${scoreMatch[3]}` : 'N/A',
-    overs: scoreMatch ? scoreMatch[4] : 'N/A',
+    overs: normalizeOversText(scoreMatch ? scoreMatch[4] : 'N/A'),
     crr: 'N/A',
     rrr: 'N/A',
     target: 'N/A',
@@ -606,7 +619,7 @@ function parseFromHtmlFallback($) {
     match: matchTitle || 'Live Match',
     batting_team: cleanText(matchTitle.split('vs')[0] || 'N/A'),
     score,
-    overs,
+    overs: normalizeOversText(overs),
     crr: 'N/A',
     rrr: 'N/A',
     target: 'N/A',
@@ -991,11 +1004,59 @@ function isPlaceholderLiveMatch(match = {}) {
 
   if (!battingTeam || battingTeam.toUpperCase() === 'N/A') return true;
   if (hasRealStatus || hasRecentAction || hasNamedBatsman || hasScoringProgress) return false;
-  return status === '' || status === 'LIVE';
+  return true;
 }
 
 function filterPlaceholderLiveMatches(items = []) {
   return items.filter((item) => !isPlaceholderLiveMatch(item));
+}
+
+function cleanMatchHeadline(value, fallback = 'Match') {
+  const title = cleanRichText(String(value || ''))
+    .replace(/\s*-\s*(commentary|live commentary|scorecard)\s*$/i, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+  return title || fallback;
+}
+
+function normalizePublicStatus(statusText, state = 'running') {
+  const status = cleanRichText(String(statusText || ''));
+  if (!status) {
+    if (state === 'upcoming') return 'Upcoming';
+    if (state === 'disrupted') return 'Alert';
+    return 'LIVE';
+  }
+
+  if (/^preview$/i.test(status) || /^upcoming match$/i.test(status)) return 'Upcoming';
+  if (/^live$/i.test(status)) return 'LIVE';
+  if (/delay|delayed/i.test(status)) return 'Delayed';
+  if (/rain|wet outfield|weather/i.test(status)) return 'Rain Delay';
+  return status;
+}
+
+function parseUtcMillis(value) {
+  const raw = cleanText(value || '');
+  if (!raw) return Number.MAX_SAFE_INTEGER;
+  const ts = Date.parse(raw);
+  return Number.isFinite(ts) ? ts : Number.MAX_SAFE_INTEGER;
+}
+
+function sortRunningMatches(items = []) {
+  return [...items].sort((a, b) => {
+    const aLive = /^live$/i.test(cleanText(a?.status || ''));
+    const bLive = /^live$/i.test(cleanText(b?.status || ''));
+    if (aLive !== bLive) return aLive ? -1 : 1;
+    return cleanText(a?.match || '').localeCompare(cleanText(b?.match || ''));
+  });
+}
+
+function sortUpcomingMatches(items = []) {
+  return [...items].sort((a, b) => {
+    const timeDiff = parseUtcMillis(a?.start_time_utc) - parseUtcMillis(b?.start_time_utc);
+    if (timeDiff !== 0) return timeDiff;
+    return cleanText(a?.match || '').localeCompare(cleanText(b?.match || ''));
+  });
 }
 
 async function fetchConfiguredSourceCandidates() {
@@ -1046,6 +1107,12 @@ async function fetchConfiguredSourceCandidates() {
 }
 
 async function buildCandidatePayload(candidate) {
+  const cacheKey = cleanText(candidate?.url || '');
+  const cached = cacheKey ? sourcePayloadCache.get(cacheKey) : null;
+  if (cached && (Date.now() - cached.ts) <= SOURCE_PAYLOAD_CACHE_TTL_MS) {
+    return cached.payload;
+  }
+
   const base = await withTimeout(
     () => fetchAndParseScore(candidate.url),
     MATCH_PARSE_TIMEOUT_MS,
@@ -1056,16 +1123,17 @@ async function buildCandidatePayload(candidate) {
   const live = augmentLiveFields(base, candidate.url);
   const status = cleanText(live.status || candidate.status || 'LIVE');
   const derivedState = classifyMatchStatus(status);
-  const matchName = cleanText(live.match || candidate.name || candidate.title || 'Match');
+  const matchName = cleanMatchHeadline(live.match || candidate.name || candidate.title || 'Match', 'Match');
+  const publicStatus = normalizePublicStatus(status, derivedState);
 
-  return {
+  const payload = {
     state: derivedState,
     running: {
       match: matchName,
-      status,
+      status: publicStatus,
       batting_team: cleanText(live.batting_team || 'N/A'),
       score: cleanText(live.score || 'N/A'),
-      overs: cleanText(live.overs || 'N/A'),
+      overs: normalizeOversText(live.overs || 'N/A'),
       crr: cleanText(live.crr || 'N/A'),
       rrr: cleanText(live.rrr || 'N/A'),
       target: cleanText(live.target || 'N/A'),
@@ -1085,7 +1153,7 @@ async function buildCandidatePayload(candidate) {
     },
     upcoming: {
       match: matchName,
-      status,
+      status: publicStatus,
       schedule: 'TBA',
       start_time_utc: '',
       venue: cleanText(live.venue || 'N/A'),
@@ -1096,7 +1164,7 @@ async function buildCandidatePayload(candidate) {
     },
     disrupted: {
       match: matchName,
-      status,
+      status: publicStatus,
       alert_type: detectAlertType(status, live.status),
       schedule: 'TBA',
       start_time_utc: '',
@@ -1107,6 +1175,12 @@ async function buildCandidatePayload(candidate) {
       source: candidate.url,
     },
   };
+
+  if (cacheKey) {
+    sourcePayloadCache.set(cacheKey, { ts: Date.now(), payload });
+  }
+
+  return payload;
 }
 
 function getCricbuzzStatusFromTitle(title) {
@@ -1264,8 +1338,8 @@ async function fetchLiveAndUpcomingMatchesFromCricbuzz(limit = RUNNING_MATCH_LIM
         { headline: '', description: '', schedule: 'TBA', start_time_utc: '', venue: '' },
       );
       return {
-        match: cleanText(details.headline || candidate.title || candidate.name || 'Upcoming Match'),
-        status: cleanText(candidate.status || 'Upcoming Match'),
+        match: cleanMatchHeadline(details.headline || candidate.title || candidate.name || 'Upcoming Match', 'Upcoming Match'),
+        status: normalizePublicStatus(candidate.status || 'Upcoming Match', 'upcoming'),
         schedule: cleanText(details.schedule || 'TBA'),
         start_time_utc: cleanText(details.start_time_utc || ''),
         venue: cleanText(details.venue || 'N/A'),
@@ -1289,8 +1363,8 @@ async function fetchLiveAndUpcomingMatchesFromCricbuzz(limit = RUNNING_MATCH_LIM
         { headline: '', description: '', schedule: 'TBA', start_time_utc: '', venue: '' },
       );
       return {
-        match: cleanText(details.headline || candidate.title || candidate.name || 'Match Alert'),
-        status: cleanText(candidate.status || 'Match Alert'),
+        match: cleanMatchHeadline(details.headline || candidate.title || candidate.name || 'Match Alert', 'Match Alert'),
+        status: normalizePublicStatus(candidate.status || 'Match Alert', 'disrupted'),
         alert_type: detectAlertType(candidate.status, details.description),
         schedule: cleanText(details.schedule || 'TBA'),
         start_time_utc: cleanText(details.start_time_utc || ''),
@@ -1307,42 +1381,16 @@ async function fetchLiveAndUpcomingMatchesFromCricbuzz(limit = RUNNING_MATCH_LIM
     .filter((entry) => entry.status === 'fulfilled' && entry.value)
     .map((entry) => entry.value);
 
-  const directSettled = await Promise.allSettled(
-    extraCandidates.map(async (candidate) => buildCandidatePayload(candidate)),
-  );
-
-  for (const entry of directSettled) {
-    if (entry.status !== 'fulfilled' || !entry.value) continue;
-    if (entry.value.state === 'running') {
-      running_matches.push(entry.value.running);
-    } else if (entry.value.state === 'upcoming') {
-      upcoming_matches.push(entry.value.upcoming);
-    } else if (entry.value.state === 'disrupted') {
-      disrupted_matches.push(entry.value.disrupted);
-    }
-  }
-
   running_matches = dedupeMatchesBySource(running_matches);
   running_matches = filterPlaceholderLiveMatches(running_matches);
   upcoming_matches = dedupeMatchesBySource(upcoming_matches);
   disrupted_matches = dedupeMatchesBySource(disrupted_matches);
 
-  const legacyBoard = await fetchLegacyBoard();
-  running_matches = dedupeMatchesBySource([
-    ...legacyBoard.running_matches,
-    ...running_matches,
-  ]);
-  running_matches = filterPlaceholderLiveMatches(running_matches);
-  upcoming_matches = dedupeMatchesBySource([
-    ...legacyBoard.upcoming_matches,
-    ...upcoming_matches,
-  ]);
-  disrupted_matches = dedupeMatchesBySource([
-    ...legacyBoard.disrupted_matches,
-    ...disrupted_matches,
-  ]);
-
-  return { running_matches, upcoming_matches, disrupted_matches };
+  return {
+    running_matches: sortRunningMatches(running_matches),
+    upcoming_matches: sortUpcomingMatches(upcoming_matches),
+    disrupted_matches,
+  };
 }
 
 async function buildFallbackBoardFromDirectSources() {
@@ -1368,7 +1416,7 @@ async function buildFallbackBoardFromDirectSources() {
 
   return {
     running_matches: filterPlaceholderLiveMatches(dedupeMatchesBySource(running_matches)),
-    upcoming_matches: dedupeMatchesBySource(upcoming_matches),
+    upcoming_matches: sortUpcomingMatches(dedupeMatchesBySource(upcoming_matches)),
     disrupted_matches: dedupeMatchesBySource(disrupted_matches),
   };
 }
@@ -1399,7 +1447,13 @@ async function fetchLegacyBoard() {
 }
 
 app.get('/api/live-score', async (req, res) => {
-  const requestedUrl = req.query.url || DEFAULT_MATCH_URL;
+  const requestedUrl = cleanText(String(req.query.url || DEFAULT_MATCH_URL || ''));
+  if (!requestedUrl) {
+    return res.status(400).json({
+      error: 'No live score source configured',
+      details: 'Provide ?url=... or set CRICKET_MATCH_URL',
+    });
+  }
   const sourceUrl = await resolveCrexSourceUrl(requestedUrl);
   const fallbackUrl = await resolveCrexSourceUrl(DEFAULT_MATCH_URL);
   const now = Date.now();
@@ -1425,7 +1479,7 @@ app.get('/api/live-score', async (req, res) => {
     cache = { ts: Date.now(), sourceUrl, payload };
     return res.json(payload);
   } catch (error) {
-    if (sourceUrl !== fallbackUrl) {
+    if (fallbackUrl && sourceUrl !== fallbackUrl) {
       try {
         const data = await fetchAndParseScore(fallbackUrl);
         const payload = {
@@ -1477,28 +1531,19 @@ app.get('/api/running-matches', async (req, res) => {
     let running_matches = liveBoard.running_matches || [];
     let upcoming_matches = liveBoard.upcoming_matches || [];
     let disrupted_matches = liveBoard.disrupted_matches || [];
-    const directSourceBoard = await buildFallbackBoardFromDirectSources();
+    let directSourceBoard = { running_matches: [], upcoming_matches: [], disrupted_matches: [] };
 
     if (!running_matches.length && !upcoming_matches.length && !disrupted_matches.length) {
+      directSourceBoard = await buildFallbackBoardFromDirectSources();
       liveBoard = directSourceBoard;
       running_matches = liveBoard.running_matches || [];
       upcoming_matches = liveBoard.upcoming_matches || [];
       disrupted_matches = liveBoard.disrupted_matches || [];
     }
 
-    running_matches = dedupeMatchesBySource([
-      ...running_matches,
-      ...(directSourceBoard.running_matches || []),
-    ]);
-    running_matches = filterPlaceholderLiveMatches(running_matches);
-    upcoming_matches = dedupeMatchesBySource([
-      ...upcoming_matches,
-      ...(directSourceBoard.upcoming_matches || []),
-    ]);
-    disrupted_matches = dedupeMatchesBySource([
-      ...disrupted_matches,
-      ...(directSourceBoard.disrupted_matches || []),
-    ]);
+    running_matches = filterPlaceholderLiveMatches(dedupeMatchesBySource(running_matches));
+    upcoming_matches = dedupeMatchesBySource(upcoming_matches);
+    disrupted_matches = dedupeMatchesBySource(disrupted_matches);
 
     const legacyBoard = await fetchLegacyBoard();
     running_matches = dedupeMatchesBySource([
@@ -1514,6 +1559,9 @@ app.get('/api/running-matches', async (req, res) => {
       ...legacyBoard.disrupted_matches,
       ...disrupted_matches,
     ]);
+
+    running_matches = sortRunningMatches(running_matches);
+    upcoming_matches = sortUpcomingMatches(upcoming_matches);
 
     const payload = {
       source: CRICBUZZ_LIVE_LIST_URL,
