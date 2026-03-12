@@ -973,6 +973,31 @@ function dedupeCandidatesByUrl(items = []) {
   return [...byKey.values()];
 }
 
+function isPlaceholderLiveMatch(match = {}) {
+  const score = cleanText(match?.score || '').toUpperCase();
+  const overs = cleanText(match?.overs || '');
+  const status = cleanText(match?.status || '').toUpperCase();
+  const battingTeam = cleanText(match?.batting_team || '');
+  const recentOvers = cleanText(match?.recent_overs || '');
+  const target = cleanText(match?.target || '').toUpperCase();
+
+  const hasRealStatus = /(need|needs|won|trail|lead|elected|require|target|day|session|stumps|rain|delay)/i.test(status);
+  const hasRecentAction = recentOvers !== '';
+  const hasNamedBatsman = Array.isArray(match?.batsman)
+    && match.batsman.some((item) => cleanText(item?.name || '').toUpperCase() !== 'N/A');
+  const hasScoringProgress = !['', 'N/A', '0-0', '0/0'].includes(score)
+    || !['', 'N/A', '0', '0.0'].includes(overs)
+    || !['', 'N/A', '0'].includes(target);
+
+  if (!battingTeam || battingTeam.toUpperCase() === 'N/A') return true;
+  if (hasRealStatus || hasRecentAction || hasNamedBatsman || hasScoringProgress) return false;
+  return status === '' || status === 'LIVE';
+}
+
+function filterPlaceholderLiveMatches(items = []) {
+  return items.filter((item) => !isPlaceholderLiveMatch(item));
+}
+
 async function fetchConfiguredSourceCandidates() {
   const manualExpanded = await Promise.all(
     [...new Set(EXTRA_SOURCE_URLS)].map(async (rawUrl) => {
@@ -1205,7 +1230,7 @@ async function fetchLiveAndUpcomingMatchesFromCricbuzz(limit = RUNNING_MATCH_LIM
   const candidates = extractRunningMatchCandidatesFromListHtml(String(response.data || ''))
     .slice(0, Math.max(1, Number(limit) || RUNNING_MATCH_LIMIT));
   const extraCandidates = await fetchConfiguredSourceCandidates();
-  const mergedCandidates = dedupeMatchesBySource([
+  const mergedCandidates = dedupeCandidatesByUrl([
     ...candidates,
     ...extraCandidates,
   ]);
@@ -1298,6 +1323,7 @@ async function fetchLiveAndUpcomingMatchesFromCricbuzz(limit = RUNNING_MATCH_LIM
   }
 
   running_matches = dedupeMatchesBySource(running_matches);
+  running_matches = filterPlaceholderLiveMatches(running_matches);
   upcoming_matches = dedupeMatchesBySource(upcoming_matches);
   disrupted_matches = dedupeMatchesBySource(disrupted_matches);
 
@@ -1306,6 +1332,7 @@ async function fetchLiveAndUpcomingMatchesFromCricbuzz(limit = RUNNING_MATCH_LIM
     ...legacyBoard.running_matches,
     ...running_matches,
   ]);
+  running_matches = filterPlaceholderLiveMatches(running_matches);
   upcoming_matches = dedupeMatchesBySource([
     ...legacyBoard.upcoming_matches,
     ...upcoming_matches,
@@ -1340,7 +1367,7 @@ async function buildFallbackBoardFromDirectSources() {
   }
 
   return {
-    running_matches: dedupeMatchesBySource(running_matches),
+    running_matches: filterPlaceholderLiveMatches(dedupeMatchesBySource(running_matches)),
     upcoming_matches: dedupeMatchesBySource(upcoming_matches),
     disrupted_matches: dedupeMatchesBySource(disrupted_matches),
   };
@@ -1463,6 +1490,7 @@ app.get('/api/running-matches', async (req, res) => {
       ...running_matches,
       ...(directSourceBoard.running_matches || []),
     ]);
+    running_matches = filterPlaceholderLiveMatches(running_matches);
     upcoming_matches = dedupeMatchesBySource([
       ...upcoming_matches,
       ...(directSourceBoard.upcoming_matches || []),
@@ -1477,6 +1505,7 @@ app.get('/api/running-matches', async (req, res) => {
       ...legacyBoard.running_matches,
       ...running_matches,
     ]);
+    running_matches = filterPlaceholderLiveMatches(running_matches);
     upcoming_matches = dedupeMatchesBySource([
       ...legacyBoard.upcoming_matches,
       ...upcoming_matches,
