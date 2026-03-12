@@ -10,9 +10,17 @@ const DEFAULT_MATCH_URL =
   process.env.CRICKET_MATCH_URL ||
   'https://crex.com/scoreboard/1057/2EJ/15th-Match/64/TI/fata-vs-hydr-15th-match-national-t20-qualifiers-2026/live';
 const CRICBUZZ_LIVE_LIST_URL = 'https://www.cricbuzz.com/cricket-match/live-scores';
+const LEGACY_BOARD_URL = String(process.env.CRICKET_LEGACY_BOARD_URL || 'https://cricket-l117.onrender.com/api/running-matches').trim();
+const EXTRA_SOURCE_URLS = [
+  DEFAULT_MATCH_URL,
+  ...String(process.env.CRICKET_EXTRA_SOURCE_URLS || '')
+    .split(/[\r\n,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean),
+];
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 15000);
 const RUNNING_CACHE_TTL_MS = Number(process.env.RUNNING_CACHE_TTL_MS || 30000);
-const RUNNING_MATCH_LIMIT = Number(process.env.RUNNING_MATCH_LIMIT || 10);
+const RUNNING_MATCH_LIMIT = Number(process.env.RUNNING_MATCH_LIMIT || 50);
 const UPCOMING_DETAILS_LIMIT = Number(process.env.UPCOMING_DETAILS_LIMIT || 12);
 const UPSTREAM_CALL_TIMEOUT_MS = Number(process.env.UPSTREAM_CALL_TIMEOUT_MS || 6500);
 
@@ -872,6 +880,148 @@ function detectAlertType(statusText, descriptionText = '') {
   return 'ALERT';
 }
 
+function isCrexSeriesUrl(url) {
+  return /crex\.com/i.test(String(url || '')) && /\/series\//i.test(String(url || ''));
+}
+
+function normalizeCrexBoardUrl(url) {
+  const source = cleanText(url);
+  if (!source) return '';
+  if (!/crex\.com/i.test(source)) return source;
+  return source.replace(/\/(info|scorecard)$/i, '/live');
+}
+
+function extractCrexBoardUrlsFromHtml(html) {
+  const source = String(html || '');
+  const plain = [...source.matchAll(/\/scoreboard\/[^"'\s<]+/g)].map((m) => m[0]);
+  const escaped = [...source.matchAll(/\\\/scoreboard\\\/[^"'\s<]+/g)]
+    .map((m) => m[0].replace(/\\\//g, '/'));
+
+  return [...new Set([...plain, ...escaped])]
+    .map((u) => normalizeCrexBoardUrl(u.startsWith('http') ? u : `https://crex.com${u}`))
+    .filter(Boolean);
+}
+
+function dedupeMatchesBySource(items = []) {
+  const byKey = new Map();
+
+  for (const item of items) {
+    const source = cleanText(item?.source || '');
+    const match = cleanText(item?.match || '');
+    const key = source || match;
+    if (!key || byKey.has(key)) continue;
+    byKey.set(key, item);
+  }
+
+  return [...byKey.values()];
+}
+
+async function fetchConfiguredSourceCandidates() {
+  const expanded = await Promise.all(
+    [...new Set(EXTRA_SOURCE_URLS)].map(async (rawUrl) => {
+      const source = cleanText(rawUrl);
+      if (!source) return [];
+
+      if (!isCrexSeriesUrl(source)) {
+        const resolved = await resolveCrexSourceUrl(source);
+        return [cleanText(resolved)];
+      }
+
+      try {
+        const response = await axios.get(source, {
+          timeout: 12000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            Referer: 'https://crex.com/',
+            Connection: 'keep-alive',
+          },
+        });
+
+        const extracted = extractCrexBoardUrlsFromHtml(String(response.data || ''));
+        return extracted.length ? extracted : [source];
+      } catch {
+        return [source];
+      }
+    }),
+  );
+
+  return [...new Set(expanded.flat().filter(Boolean))].map((url) => ({
+    url,
+    title: '',
+    name: '',
+    status: '',
+    state: 'running',
+    series: /crex\.com/i.test(url) ? 'CREX Source' : 'Direct Source',
+    match_info: 'Manual source',
+  }));
+}
+
+async function buildCandidatePayload(candidate) {
+  const base = await withTimeout(
+    () => fetchAndParseScore(candidate.url),
+    UPSTREAM_CALL_TIMEOUT_MS,
+    null,
+  );
+  if (!base) return null;
+
+  const live = augmentLiveFields(base, candidate.url);
+  const status = cleanText(live.status || candidate.status || 'LIVE');
+  const derivedState = classifyMatchStatus(status);
+  const matchName = cleanText(live.match || candidate.name || candidate.title || 'Match');
+
+  return {
+    state: derivedState,
+    running: {
+      match: matchName,
+      status,
+      batting_team: cleanText(live.batting_team || 'N/A'),
+      score: cleanText(live.score || 'N/A'),
+      overs: cleanText(live.overs || 'N/A'),
+      crr: cleanText(live.crr || 'N/A'),
+      rrr: cleanText(live.rrr || 'N/A'),
+      target: cleanText(live.target || 'N/A'),
+      balls_remaining: cleanText(live.balls_remaining || 'N/A'),
+      runs_to_win: cleanText(live.runs_to_win || 'N/A'),
+      recent_overs: cleanText(live.recent_overs || ''),
+      venue: cleanText(live.venue || 'N/A'),
+      toss: cleanText(live.toss || 'N/A'),
+      umpires: Array.isArray(live.umpires) ? live.umpires : [],
+      series: cleanText(candidate.series || 'N/A'),
+      match_info: cleanText(candidate.match_info || 'N/A'),
+      team_logos: live.team_logos || {},
+      batsman: Array.isArray(live.batsman) ? live.batsman.slice(0, 2) : [],
+      bowler: live.bowler || {},
+      win_probability: live.win_probability || { team_a: 50, team_b: 50 },
+      source: candidate.url,
+    },
+    upcoming: {
+      match: matchName,
+      status,
+      schedule: 'TBA',
+      start_time_utc: '',
+      venue: cleanText(live.venue || 'N/A'),
+      match_info: cleanText(candidate.match_info || 'N/A'),
+      series: cleanText(candidate.series || 'N/A'),
+      description: cleanText(live.status || ''),
+      source: candidate.url,
+    },
+    disrupted: {
+      match: matchName,
+      status,
+      alert_type: detectAlertType(status, live.status),
+      schedule: 'TBA',
+      start_time_utc: '',
+      venue: cleanText(live.venue || 'N/A'),
+      match_info: cleanText(candidate.match_info || 'N/A'),
+      series: cleanText(candidate.series || 'N/A'),
+      description: cleanText(live.status || ''),
+      source: candidate.url,
+    },
+  };
+}
+
 function getCricbuzzStatusFromTitle(title) {
   const cleanTitle = cleanText(title || '');
   const bits = cleanTitle.split(' - ').map((x) => cleanText(x)).filter(Boolean);
@@ -992,53 +1142,30 @@ async function fetchLiveAndUpcomingMatchesFromCricbuzz(limit = RUNNING_MATCH_LIM
 
   const candidates = extractRunningMatchCandidatesFromListHtml(String(response.data || ''))
     .slice(0, Math.max(1, Number(limit) || RUNNING_MATCH_LIMIT));
+  const extraCandidates = await fetchConfiguredSourceCandidates();
+  const mergedCandidates = dedupeMatchesBySource([
+    ...candidates,
+    ...extraCandidates,
+  ]);
 
-  if (!candidates.length) {
+  if (!mergedCandidates.length) {
     return { running_matches: [], upcoming_matches: [], disrupted_matches: [] };
   }
 
-  const runningCandidates = candidates.filter((c) => c.state === 'running');
-  const upcomingCandidates = candidates.filter((c) => c.state === 'upcoming');
-  const disruptedCandidates = candidates.filter((c) => c.state === 'disrupted');
+  const runningCandidates = mergedCandidates.filter((c) => c.state === 'running');
+  const upcomingCandidates = mergedCandidates.filter((c) => c.state === 'upcoming');
+  const disruptedCandidates = mergedCandidates.filter((c) => c.state === 'disrupted');
 
   const runningSettled = await Promise.allSettled(
     runningCandidates.map(async (candidate) => {
-      const base = await withTimeout(
-        () => fetchAndParseScore(candidate.url),
-        UPSTREAM_CALL_TIMEOUT_MS,
-        null,
-      );
-      if (!base) return null;
-      const live = augmentLiveFields(base, candidate.url);
-      const status = cleanText(live.status || candidate.status || 'LIVE');
-      if (isNonRunningStatus(status)) return null;
-      return {
-        match: cleanText(live.match || candidate.name),
-        status,
-        batting_team: cleanText(live.batting_team || 'N/A'),
-        score: cleanText(live.score || 'N/A'),
-        overs: cleanText(live.overs || 'N/A'),
-        crr: cleanText(live.crr || 'N/A'),
-        rrr: cleanText(live.rrr || 'N/A'),
-        target: cleanText(live.target || 'N/A'),
-        balls_remaining: cleanText(live.balls_remaining || 'N/A'),
-        runs_to_win: cleanText(live.runs_to_win || 'N/A'),
-        recent_overs: cleanText(live.recent_overs || ''),
-        venue: cleanText(live.venue || 'N/A'),
-        toss: cleanText(live.toss || 'N/A'),
-        umpires: Array.isArray(live.umpires) ? live.umpires : [],
-        series: cleanText(candidate.series || 'N/A'),
-        match_info: cleanText(candidate.match_info || 'N/A'),
-        team_logos: live.team_logos || {},
-        batsman: Array.isArray(live.batsman) ? live.batsman.slice(0, 2) : [],
-        bowler: live.bowler || {},
-        win_probability: live.win_probability || { team_a: 50, team_b: 50 },
-        source: candidate.url,
-      };
+      const payload = await buildCandidatePayload(candidate);
+      if (!payload) return null;
+      if (payload.state !== 'running' || isNonRunningStatus(payload.running.status)) return null;
+      return payload.running;
     }),
   );
 
-  const running_matches = runningSettled
+  let running_matches = runningSettled
     .filter((entry) => entry.status === 'fulfilled' && entry.value)
     .map((entry) => entry.value);
 
@@ -1063,7 +1190,7 @@ async function fetchLiveAndUpcomingMatchesFromCricbuzz(limit = RUNNING_MATCH_LIM
     }),
   );
 
-  const upcoming_matches = upcomingSettled
+  let upcoming_matches = upcomingSettled
     .filter((entry) => entry.status === 'fulfilled' && entry.value)
     .map((entry) => entry.value);
 
@@ -1089,11 +1216,97 @@ async function fetchLiveAndUpcomingMatchesFromCricbuzz(limit = RUNNING_MATCH_LIM
     }),
   );
 
-  const disrupted_matches = disruptedSettled
+  let disrupted_matches = disruptedSettled
     .filter((entry) => entry.status === 'fulfilled' && entry.value)
     .map((entry) => entry.value);
 
+  const directSettled = await Promise.allSettled(
+    extraCandidates.map(async (candidate) => buildCandidatePayload(candidate)),
+  );
+
+  for (const entry of directSettled) {
+    if (entry.status !== 'fulfilled' || !entry.value) continue;
+    if (entry.value.state === 'running') {
+      running_matches.push(entry.value.running);
+    } else if (entry.value.state === 'upcoming') {
+      upcoming_matches.push(entry.value.upcoming);
+    } else if (entry.value.state === 'disrupted') {
+      disrupted_matches.push(entry.value.disrupted);
+    }
+  }
+
+  running_matches = dedupeMatchesBySource(running_matches);
+  upcoming_matches = dedupeMatchesBySource(upcoming_matches);
+  disrupted_matches = dedupeMatchesBySource(disrupted_matches);
+
+  const legacyBoard = await fetchLegacyBoard();
+  running_matches = dedupeMatchesBySource([
+    ...legacyBoard.running_matches,
+    ...running_matches,
+  ]);
+  upcoming_matches = dedupeMatchesBySource([
+    ...legacyBoard.upcoming_matches,
+    ...upcoming_matches,
+  ]);
+  disrupted_matches = dedupeMatchesBySource([
+    ...legacyBoard.disrupted_matches,
+    ...disrupted_matches,
+  ]);
+
   return { running_matches, upcoming_matches, disrupted_matches };
+}
+
+async function buildFallbackBoardFromDirectSources() {
+  const directCandidates = await fetchConfiguredSourceCandidates();
+  const settled = await Promise.allSettled(
+    directCandidates.map(async (candidate) => buildCandidatePayload(candidate)),
+  );
+
+  const running_matches = [];
+  const upcoming_matches = [];
+  const disrupted_matches = [];
+
+  for (const entry of settled) {
+    if (entry.status !== 'fulfilled' || !entry.value) continue;
+    if (entry.value.state === 'running') {
+      running_matches.push(entry.value.running);
+    } else if (entry.value.state === 'upcoming') {
+      upcoming_matches.push(entry.value.upcoming);
+    } else if (entry.value.state === 'disrupted') {
+      disrupted_matches.push(entry.value.disrupted);
+    }
+  }
+
+  return {
+    running_matches: dedupeMatchesBySource(running_matches),
+    upcoming_matches: dedupeMatchesBySource(upcoming_matches),
+    disrupted_matches: dedupeMatchesBySource(disrupted_matches),
+  };
+}
+
+async function fetchLegacyBoard() {
+  if (!LEGACY_BOARD_URL) {
+    return { running_matches: [], upcoming_matches: [], disrupted_matches: [] };
+  }
+
+  try {
+    const response = await axios.get(LEGACY_BOARD_URL, {
+      timeout: 12000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+        Accept: 'application/json,text/plain,*/*',
+      },
+    });
+
+    const payload = response.data && typeof response.data === 'object' ? response.data : {};
+    return {
+      running_matches: Array.isArray(payload.running_matches) ? payload.running_matches : [],
+      upcoming_matches: Array.isArray(payload.upcoming_matches) ? payload.upcoming_matches : [],
+      disrupted_matches: Array.isArray(payload.disrupted_matches) ? payload.disrupted_matches : [],
+    };
+  } catch {
+    return { running_matches: [], upcoming_matches: [], disrupted_matches: [] };
+  }
 }
 
 app.get('/api/live-score', async (req, res) => {
@@ -1163,7 +1376,7 @@ app.get('/api/running-matches', async (req, res) => {
   const now = Date.now();
   const requestedLimit = Number(req.query.limit);
   const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
-    ? Math.min(Math.floor(requestedLimit), 40)
+    ? Math.min(Math.floor(requestedLimit), 100)
     : RUNNING_MATCH_LIMIT;
 
   if (runningMatchesCache.payload && now - runningMatchesCache.ts <= RUNNING_CACHE_TTL_MS) {
@@ -1171,10 +1384,32 @@ app.get('/api/running-matches', async (req, res) => {
   }
 
   try {
-    const liveBoard = await fetchLiveAndUpcomingMatchesFromCricbuzz(limit);
-    const running_matches = liveBoard.running_matches || [];
-    const upcoming_matches = liveBoard.upcoming_matches || [];
-    const disrupted_matches = liveBoard.disrupted_matches || [];
+    let liveBoard = await fetchLiveAndUpcomingMatchesFromCricbuzz(limit);
+    let running_matches = liveBoard.running_matches || [];
+    let upcoming_matches = liveBoard.upcoming_matches || [];
+    let disrupted_matches = liveBoard.disrupted_matches || [];
+
+    if (!running_matches.length && !upcoming_matches.length && !disrupted_matches.length) {
+      liveBoard = await buildFallbackBoardFromDirectSources();
+      running_matches = liveBoard.running_matches || [];
+      upcoming_matches = liveBoard.upcoming_matches || [];
+      disrupted_matches = liveBoard.disrupted_matches || [];
+    }
+
+    const legacyBoard = await fetchLegacyBoard();
+    running_matches = dedupeMatchesBySource([
+      ...legacyBoard.running_matches,
+      ...running_matches,
+    ]);
+    upcoming_matches = dedupeMatchesBySource([
+      ...legacyBoard.upcoming_matches,
+      ...upcoming_matches,
+    ]);
+    disrupted_matches = dedupeMatchesBySource([
+      ...legacyBoard.disrupted_matches,
+      ...disrupted_matches,
+    ]);
+
     const payload = {
       source: CRICBUZZ_LIVE_LIST_URL,
       updated_at: new Date().toISOString(),
