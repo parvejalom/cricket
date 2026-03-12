@@ -10,6 +10,7 @@ const DEFAULT_MATCH_URL =
   process.env.CRICKET_MATCH_URL ||
   'https://crex.com/scoreboard/1057/2EJ/15th-Match/64/TI/fata-vs-hydr-15th-match-national-t20-qualifiers-2026/live';
 const CRICBUZZ_LIVE_LIST_URL = 'https://www.cricbuzz.com/cricket-match/live-scores';
+const CREX_LIVE_MATCHES_URL = String(process.env.CREX_LIVE_MATCHES_URL || 'https://crex.com/live-matches').trim();
 const LEGACY_BOARD_URL = String(process.env.CRICKET_LEGACY_BOARD_URL || 'https://cricket-l117.onrender.com/api/running-matches').trim();
 const EXTRA_SOURCE_URLS = [
   DEFAULT_MATCH_URL,
@@ -23,6 +24,7 @@ const RUNNING_CACHE_TTL_MS = Number(process.env.RUNNING_CACHE_TTL_MS || 30000);
 const RUNNING_MATCH_LIMIT = Number(process.env.RUNNING_MATCH_LIMIT || 50);
 const UPCOMING_DETAILS_LIMIT = Number(process.env.UPCOMING_DETAILS_LIMIT || 12);
 const UPSTREAM_CALL_TIMEOUT_MS = Number(process.env.UPSTREAM_CALL_TIMEOUT_MS || 6500);
+const MATCH_PARSE_TIMEOUT_MS = Math.max(UPSTREAM_CALL_TIMEOUT_MS, 12000);
 
 let cache = {
   ts: 0,
@@ -58,6 +60,19 @@ app.use(express.static(path.join(__dirname, 'public')));
 function cleanText(input) {
   if (typeof input !== 'string') return '';
   return input.replace(/\s+/g, ' ').trim();
+}
+
+function cleanRichText(input) {
+  if (typeof input !== 'string') return '';
+
+  return cleanText(
+    input
+      .replace(/&l;/g, '<')
+      .replace(/&g;/g, '>')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/<[^>]*>/g, ' ')
+  );
 }
 
 async function withTimeout(task, timeoutMs, fallbackValue = null) {
@@ -378,9 +393,9 @@ function parseFromCrex($, html) {
       bowler: cleanText(live.b3image || ''),
     },
     recent_overs: cleanText(String(live.d || '').replace(/\./g, ' ')),
-    status: cleanText(live.comment1 || ''),
-    last_wicket: cleanText(live.lastWicket || live.lastwicket || live.wkt || ''),
-    next_batsman: cleanText(live.pname3 || live.nextBatsman || ''),
+    status: cleanRichText(live.comment1 || ''),
+    last_wicket: cleanRichText(live.lastWicket || live.lastwicket || live.wkt || ''),
+    next_batsman: cleanRichText(live.pname3 || live.nextBatsman || ''),
     match_format: cleanText(live.mt || live.fo || 'T20'),
     win_probability: parseCrexWinProb(live.wp, live.rtKey || team1Key),
     live_stats: {
@@ -411,7 +426,7 @@ function parseFromCrex($, html) {
     },
     prediction: {
       win_probability: parseCrexWinProb(live.wp, live.rtKey || team1Key),
-      dls_status: /rain|dls/i.test(cleanText(live.comment1 || '')) ? cleanText(live.comment1) : 'No DLS',
+      dls_status: /rain|dls/i.test(cleanRichText(live.comment1 || '')) ? cleanRichText(live.comment1) : 'No DLS',
       chase: {
         target: Number.isFinite(Number(live.rT)) && Number(live.rT) > 0 ? Number(live.rT) : null,
         runs_to_win: Number.isFinite(Number(live.rT)) && Number(live.rT) > 0 ? Number(live.rT) : null,
@@ -902,6 +917,36 @@ function extractCrexBoardUrlsFromHtml(html) {
     .filter(Boolean);
 }
 
+async function fetchCrexLiveMatchCandidates() {
+  if (!CREX_LIVE_MATCHES_URL) return [];
+
+  try {
+    const response = await axios.get(CREX_LIVE_MATCHES_URL, {
+      timeout: 12000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        Referer: 'https://crex.com/',
+        Connection: 'keep-alive',
+      },
+    });
+
+    const extracted = extractCrexBoardUrlsFromHtml(String(response.data || ''));
+    return [...new Set(extracted)].map((url) => ({
+      url,
+      title: '',
+      name: '',
+      status: 'LIVE',
+      state: 'running',
+      series: 'CREX Live Board',
+      match_info: 'Auto-detected from CREX live-matches',
+    }));
+  } catch {
+    return [];
+  }
+}
+
 function dedupeMatchesBySource(items = []) {
   const byKey = new Map();
 
@@ -916,8 +961,20 @@ function dedupeMatchesBySource(items = []) {
   return [...byKey.values()];
 }
 
+function dedupeCandidatesByUrl(items = []) {
+  const byKey = new Map();
+
+  for (const item of items) {
+    const key = cleanText(item?.url || '');
+    if (!key || byKey.has(key)) continue;
+    byKey.set(key, item);
+  }
+
+  return [...byKey.values()];
+}
+
 async function fetchConfiguredSourceCandidates() {
-  const expanded = await Promise.all(
+  const manualExpanded = await Promise.all(
     [...new Set(EXTRA_SOURCE_URLS)].map(async (rawUrl) => {
       const source = cleanText(rawUrl);
       if (!source) return [];
@@ -946,8 +1003,7 @@ async function fetchConfiguredSourceCandidates() {
       }
     }),
   );
-
-  return [...new Set(expanded.flat().filter(Boolean))].map((url) => ({
+  const manualCandidates = [...new Set(manualExpanded.flat().filter(Boolean))].map((url) => ({
     url,
     title: '',
     name: '',
@@ -956,12 +1012,18 @@ async function fetchConfiguredSourceCandidates() {
     series: /crex\.com/i.test(url) ? 'CREX Source' : 'Direct Source',
     match_info: 'Manual source',
   }));
+
+  const crexLiveCandidates = await fetchCrexLiveMatchCandidates();
+  return dedupeCandidatesByUrl([
+    ...crexLiveCandidates,
+    ...manualCandidates,
+  ]);
 }
 
 async function buildCandidatePayload(candidate) {
   const base = await withTimeout(
     () => fetchAndParseScore(candidate.url),
-    UPSTREAM_CALL_TIMEOUT_MS,
+    MATCH_PARSE_TIMEOUT_MS,
     null,
   );
   if (!base) return null;
@@ -1388,13 +1450,27 @@ app.get('/api/running-matches', async (req, res) => {
     let running_matches = liveBoard.running_matches || [];
     let upcoming_matches = liveBoard.upcoming_matches || [];
     let disrupted_matches = liveBoard.disrupted_matches || [];
+    const directSourceBoard = await buildFallbackBoardFromDirectSources();
 
     if (!running_matches.length && !upcoming_matches.length && !disrupted_matches.length) {
-      liveBoard = await buildFallbackBoardFromDirectSources();
+      liveBoard = directSourceBoard;
       running_matches = liveBoard.running_matches || [];
       upcoming_matches = liveBoard.upcoming_matches || [];
       disrupted_matches = liveBoard.disrupted_matches || [];
     }
+
+    running_matches = dedupeMatchesBySource([
+      ...running_matches,
+      ...(directSourceBoard.running_matches || []),
+    ]);
+    upcoming_matches = dedupeMatchesBySource([
+      ...upcoming_matches,
+      ...(directSourceBoard.upcoming_matches || []),
+    ]);
+    disrupted_matches = dedupeMatchesBySource([
+      ...disrupted_matches,
+      ...(directSourceBoard.disrupted_matches || []),
+    ]);
 
     const legacyBoard = await fetchLegacyBoard();
     running_matches = dedupeMatchesBySource([
@@ -1423,7 +1499,9 @@ app.get('/api/running-matches', async (req, res) => {
       disrupted_matches,
       cached: false,
     };
-    runningMatchesCache = { ts: Date.now(), payload };
+    if (payload.total > 0) {
+      runningMatchesCache = { ts: Date.now(), payload };
+    }
     return res.json(payload);
   } catch (error) {
     if (runningMatchesCache.payload) {
