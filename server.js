@@ -8,7 +8,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const DEFAULT_MATCH_URL = String(process.env.CRICKET_MATCH_URL || '').trim();
 const CRICBUZZ_LIVE_LIST_URL = 'https://www.cricbuzz.com/cricket-match/live-scores';
-const CREX_LIVE_MATCHES_URL = String(process.env.CREX_LIVE_MATCHES_URL || 'https://crex.com/live-matches').trim();
 const LEGACY_BOARD_URL = String(process.env.CRICKET_LEGACY_BOARD_URL || 'https://cricket-l117.onrender.com/api/running-matches').trim();
 const EXTRA_SOURCE_URLS = [
   ...(DEFAULT_MATCH_URL ? [DEFAULT_MATCH_URL] : []),
@@ -270,184 +269,6 @@ function augmentLiveFields(base, sourceUrl) {
 function safeNum(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
-}
-
-function parseCrexState(html) {
-  const match = html.match(/<script id="app-root-state" type="application\/json">([\s\S]*?)<\/script>/i);
-  if (!match) return null;
-
-  const decoded = match[1]
-    .replace(/&q;/g, '"')
-    .replace(/&a;/g, '&')
-    .replace(/&s;/g, "'")
-    .replace(/\r?\n/g, '');
-
-  try {
-    return JSON.parse(decoded);
-  } catch {
-    return null;
-  }
-}
-
-function parseCrexWinProb(raw, battingKey) {
-  const parts = String(raw || '').split(',');
-  if (parts.length < 3) return { team_a: 50, team_b: 50 };
-  const teamKey = parts[0];
-  const aVal = safeNum(parts[1], 0);
-  const bVal = safeNum(parts[2], 0);
-  const total = aVal + bVal;
-  if (total <= 0) return { team_a: 50, team_b: 50 };
-
-  const teamAFirst = teamKey === battingKey;
-  const firstPct = Math.round((aVal / total) * 100);
-  const secondPct = 100 - firstPct;
-  return teamAFirst
-    ? { team_a: firstPct, team_b: secondPct }
-    : { team_a: secondPct, team_b: firstPct };
-}
-
-function parseFromCrex($, html) {
-  const state = parseCrexState(html);
-  if (!state || typeof state !== 'object') return null;
-
-  const liveKey = Object.keys(state).find((k) => k.includes('/w/sV3.php'));
-  const mapKey = Object.keys(state).find((k) => k.includes('getHomeMapDataliveparsing'));
-  const feedKey = Object.keys(state).find((k) => k.includes('commentary/getBallFeeds'));
-  if (!liveKey) return null;
-
-  const live = state[liveKey] || {};
-  const mapping = state[mapKey] || {};
-  const feeds = Array.isArray(state[feedKey]) ? state[feedKey] : [];
-  const teams = Array.isArray(mapping.t) ? mapping.t : [];
-  const players = Array.isArray(mapping.p) ? mapping.p : [];
-
-  const team1Key = String(live.a || live.team1_fkey || '').replace('^', '');
-  const team2Key = String((live.a || '').split('.')[1] || live.team2_fkey || '');
-  const team1Map = teams.find((t) => t.f_key === team1Key) || {};
-  const team2Map = teams.find((t) => t.f_key === team2Key) || {};
-
-  const team1Name = cleanText(live.team1_f_n || team1Map.n || live.team1 || 'Team A');
-  const team2Name = cleanText(live.team2_f_n || team2Map.n || live.team2 || 'Team B');
-  const inningNo = safeNum(live.inning, 1);
-  const battingTeam = inningNo === 2 ? team2Name : team1Name;
-
-  const b1Name = cleanText(live.player_full_name1 || live.pname1 || 'N/A');
-  const b2Name = cleanText(live.player_full_name2 || live.pname2 || 'N/A');
-  const bowlerName = cleanText(live.bowler_full_name || live.bname || 'N/A');
-
-  const bwrText = String(live.bwr || '0-0');
-  const bwrMatch = bwrText.match(/(\d+)-(\d+)/);
-  const bWk = bwrMatch ? safeNum(bwrMatch[1]) : 0;
-  const bRuns = bwrMatch ? safeNum(bwrMatch[2]) : 0;
-
-  const overBlocks = Array.isArray(live.rb) ? live.rb : [];
-  const powerplayBlock = overBlocks.find((o) => safeNum(o.o) === 6);
-  const powerplayScore = cleanText(powerplayBlock?.ts || '');
-  const lastOvers = Array.isArray(live.lastovers) ? live.lastovers : [];
-  const latestOver = lastOvers[lastOvers.length - 1] || {};
-  const latestOverInfo = Array.isArray(latestOver.overinfo) ? latestOver.overinfo.map((x) => String(x)) : [];
-
-  const ballFeeds = feeds
-    .filter((f) => f && (f.type === 'b' || (f.commentary && f.commentary.type === 'b')))
-    .map((f) => f.commentary || f)
-    .slice(0, 6);
-  const ballByBall = ballFeeds.map((b) => String(b.b || b.u || '.'));
-
-  const hasWagon = ballFeeds.some((b) => b.wagon_w && b.wagon_w !== 'NA');
-  const hasWide = ballByBall.some((x) => /wd/i.test(x));
-  const hasNoBall = ballByBall.some((x) => /nb/i.test(x));
-
-  return {
-    match: `${team1Name} vs ${team2Name}`,
-    batting_team: battingTeam,
-    score: cleanText(live.score1 || 'N/A'),
-    overs: normalizeOversText(live.over1 || 'N/A'),
-    crr: cleanText(live.crr || 'N/A'),
-    rrr: cleanText(live.rrr || 'N/A'),
-    target: cleanText(live.rT || 'N/A') === '0' ? 'N/A' : cleanText(live.rT || 'N/A'),
-    balls_remaining: 'N/A',
-    runs_to_win: cleanText(live.rT || 'N/A') === '0' ? 'N/A' : cleanText(live.rT || 'N/A'),
-    partnership: {
-      runs: safeNum(live.partnerruns),
-      balls: safeNum(live.partnerballs),
-    },
-    batsman: [
-      {
-        name: b1Name,
-        runs: safeNum(live.run1),
-        balls: safeNum(String(live.ball1 || '').replace(/[()]/g, '')),
-        sr: safeNum(live.sr1),
-        fours: safeNum(live.four1 || live.f1),
-        sixes: safeNum(live.six1 || live.s1),
-      },
-      {
-        name: b2Name,
-        runs: safeNum(live.run2),
-        balls: safeNum(String(live.ball2 || '').replace(/[()]/g, '')),
-        sr: safeNum(live.sr2),
-        fours: safeNum(live.four2 || live.f2),
-        sixes: safeNum(live.six2 || live.s2),
-      },
-    ],
-    bowler: {
-      name: bowlerName,
-      overs: cleanText(live.bover || 'N/A'),
-      runs: bRuns,
-      economy: safeNum(live.beco),
-      wickets: bWk,
-    },
-    team_logos: {
-      team_a: cleanText(live.team1flag || ''),
-      team_b: cleanText(live.team2flag || ''),
-    },
-    player_images: {
-      batsman1: cleanText(live.b1image || ''),
-      batsman2: cleanText(live.b2image || ''),
-      bowler: cleanText(live.b3image || ''),
-    },
-    recent_overs: cleanText(String(live.d || '').replace(/\./g, ' ')),
-    status: cleanRichText(live.comment1 || ''),
-    last_wicket: cleanRichText(live.lastWicket || live.lastwicket || live.wkt || ''),
-    next_batsman: cleanRichText(live.pname3 || live.nextBatsman || ''),
-    match_format: cleanText(live.mt || live.fo || 'T20'),
-    win_probability: parseCrexWinProb(live.wp, live.rtKey || team1Key),
-    live_stats: {
-      last_over_summary: latestOverInfo.join(' ') || 'N/A',
-      ball_by_ball: ballByBall,
-      powerplay_score: powerplayScore || (safeNum(normalizeOversText(live.over1)) <= 6 ? cleanText(live.score1 || 'N/A') : 'N/A'),
-      run_comparison: {
-        current_rr: Number.isFinite(Number(live.crr)) ? Number(live.crr) : null,
-        required_rr: Number.isFinite(Number(live.rrr)) ? Number(live.rrr) : null,
-        projected_score: null,
-      },
-      wagon_wheel: {
-        available: hasWagon,
-        note: hasWagon ? 'Wagon wheel events detected' : 'Optional - not in current feed',
-      },
-    },
-    match_flow: {
-      over_progress: {
-        balls_in_over: parseOverParts(normalizeOversText(live.over1 || '0')).ballsInCurrentOver,
-        balls_per_over: 6,
-        progress_pct: Math.round((parseOverParts(normalizeOversText(live.over1 || '0')).ballsInCurrentOver / 6) * 100),
-      },
-      indicators: {
-        free_hit: hasNoBall,
-        no_ball: hasNoBall,
-        wide: hasWide,
-      },
-    },
-    prediction: {
-      win_probability: parseCrexWinProb(live.wp, live.rtKey || team1Key),
-      dls_status: /rain|dls/i.test(cleanRichText(live.comment1 || '')) ? cleanRichText(live.comment1) : 'No DLS',
-      chase: {
-        target: Number.isFinite(Number(live.rT)) && Number(live.rT) > 0 ? Number(live.rT) : null,
-        runs_to_win: Number.isFinite(Number(live.rT)) && Number(live.rT) > 0 ? Number(live.rT) : null,
-        current_runs: safeNum(String(live.score1 || '0-0').split('-')[0]),
-      },
-    },
-    parse_vendor: 'crex',
-  };
 }
 
 function extractEscapedJsonObject(html, key) {
@@ -748,23 +569,6 @@ function parseMatchMetaFromCricbuzzHtml($, html) {
 }
 
 async function fetchAndParseScore(sourceUrl) {
-  if (/crex\.com/i.test(sourceUrl)) {
-    const response = await axios.get(sourceUrl, {
-      timeout: 12000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        Referer: 'https://crex.com/',
-        Connection: 'keep-alive',
-      },
-    });
-    const html = response.data;
-    const $ = cheerio.load(html);
-    const crex = parseFromCrex($, html);
-    if (crex) return crex;
-  }
-
   const requestOptions = {
     timeout: 12000,
     headers: {
@@ -839,40 +643,14 @@ async function fetchAndParseScore(sourceUrl) {
   };
 }
 
-async function resolveCrexSourceUrl(inputUrl) {
+function isCricbuzzUrl(inputUrl) {
+  return /(^https?:\/\/)?(www\.)?cricbuzz\.com\//i.test(String(inputUrl || '').trim());
+}
+
+async function resolveSourceUrl(inputUrl) {
   const source = String(inputUrl || '').trim();
   if (!source) return source;
-  if (!/crex\.com/i.test(source) || !/\/series\//i.test(source)) return source;
-
-  try {
-    const response = await axios.get(source, {
-      timeout: 12000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        Referer: 'https://crex.com/',
-        Connection: 'keep-alive',
-      },
-    });
-
-    const html = String(response.data || '');
-    const plain = [...html.matchAll(/\/scoreboard\/[^"'\s<]+/g)].map((m) => m[0]);
-    const escaped = [...html.matchAll(/\\\/scoreboard\\\/[^"'\s<]+/g)]
-      .map((m) => m[0].replace(/\\\//g, '/'));
-    const merged = [...plain, ...escaped]
-      .map((u) => (u.startsWith('http') ? u : `https://crex.com${u}`));
-    const unique = [...new Set(merged)];
-    if (!unique.length) return source;
-
-    const live = unique.find((u) => /\/live$/i.test(u));
-    if (live) return live;
-
-    const normalized = unique[0].replace(/\/(info|scorecard)$/i, '/live');
-    return normalized;
-  } catch {
-    return source;
-  }
+  return isCricbuzzUrl(source) ? source : '';
 }
 
 function toAbsoluteCricbuzzUrl(input) {
@@ -906,58 +684,6 @@ function detectAlertType(statusText, descriptionText = '') {
   if (/(delay|delayed|late start|start delayed)/i.test(combined)) return 'DELAYED';
   if (/(rain|wet outfield|weather)/i.test(combined)) return 'RAIN';
   return 'ALERT';
-}
-
-function isCrexSeriesUrl(url) {
-  return /crex\.com/i.test(String(url || '')) && /\/series\//i.test(String(url || ''));
-}
-
-function normalizeCrexBoardUrl(url) {
-  const source = cleanText(url);
-  if (!source) return '';
-  if (!/crex\.com/i.test(source)) return source;
-  return source.replace(/\/(info|scorecard)$/i, '/live');
-}
-
-function extractCrexBoardUrlsFromHtml(html) {
-  const source = String(html || '');
-  const plain = [...source.matchAll(/\/scoreboard\/[^"'\s<]+/g)].map((m) => m[0]);
-  const escaped = [...source.matchAll(/\\\/scoreboard\\\/[^"'\s<]+/g)]
-    .map((m) => m[0].replace(/\\\//g, '/'));
-
-  return [...new Set([...plain, ...escaped])]
-    .map((u) => normalizeCrexBoardUrl(u.startsWith('http') ? u : `https://crex.com${u}`))
-    .filter(Boolean);
-}
-
-async function fetchCrexLiveMatchCandidates() {
-  if (!CREX_LIVE_MATCHES_URL) return [];
-
-  try {
-    const response = await axios.get(CREX_LIVE_MATCHES_URL, {
-      timeout: 12000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        Referer: 'https://crex.com/',
-        Connection: 'keep-alive',
-      },
-    });
-
-    const extracted = extractCrexBoardUrlsFromHtml(String(response.data || ''));
-    return [...new Set(extracted)].map((url) => ({
-      url,
-      title: '',
-      name: '',
-      status: 'LIVE',
-      state: 'running',
-      series: 'CREX Live Board',
-      match_info: 'Auto-detected from CREX live-matches',
-    }));
-  } catch {
-    return [];
-  }
 }
 
 function dedupeMatchesBySource(items = []) {
@@ -1064,29 +790,8 @@ async function fetchConfiguredSourceCandidates() {
     [...new Set(EXTRA_SOURCE_URLS)].map(async (rawUrl) => {
       const source = cleanText(rawUrl);
       if (!source) return [];
-
-      if (!isCrexSeriesUrl(source)) {
-        const resolved = await resolveCrexSourceUrl(source);
-        return [cleanText(resolved)];
-      }
-
-      try {
-        const response = await axios.get(source, {
-          timeout: 12000,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
-            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            Referer: 'https://crex.com/',
-            Connection: 'keep-alive',
-          },
-        });
-
-        const extracted = extractCrexBoardUrlsFromHtml(String(response.data || ''));
-        return extracted.length ? extracted : [source];
-      } catch {
-        return [source];
-      }
+      const resolved = await resolveSourceUrl(source);
+      return resolved ? [cleanText(resolved)] : [];
     }),
   );
   const manualCandidates = [...new Set(manualExpanded.flat().filter(Boolean))].map((url) => ({
@@ -1095,15 +800,11 @@ async function fetchConfiguredSourceCandidates() {
     name: '',
     status: '',
     state: 'running',
-    series: /crex\.com/i.test(url) ? 'CREX Source' : 'Direct Source',
+    series: 'Direct Source',
     match_info: 'Manual source',
   }));
 
-  const crexLiveCandidates = await fetchCrexLiveMatchCandidates();
-  return dedupeCandidatesByUrl([
-    ...crexLiveCandidates,
-    ...manualCandidates,
-  ]);
+  return dedupeCandidatesByUrl(manualCandidates);
 }
 
 async function buildCandidatePayload(candidate) {
@@ -1454,8 +1155,14 @@ app.get('/api/live-score', async (req, res) => {
       details: 'Provide ?url=... or set CRICKET_MATCH_URL',
     });
   }
-  const sourceUrl = await resolveCrexSourceUrl(requestedUrl);
-  const fallbackUrl = await resolveCrexSourceUrl(DEFAULT_MATCH_URL);
+  const sourceUrl = await resolveSourceUrl(requestedUrl);
+  const fallbackUrl = await resolveSourceUrl(DEFAULT_MATCH_URL);
+  if (!sourceUrl) {
+    return res.status(400).json({
+      error: 'Only Cricbuzz URLs are supported',
+      details: 'Provide a cricbuzz.com live match URL or set CRICKET_MATCH_URL to a Cricbuzz URL',
+    });
+  }
   const now = Date.now();
 
   if (
